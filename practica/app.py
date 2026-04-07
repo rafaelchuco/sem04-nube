@@ -554,6 +554,22 @@ HTML = """
       border: 1px solid rgba(148, 163, 184, 0.16);
     }
 
+    .platform-notice {
+      display: none;
+      margin-top: 16px;
+      padding: 13px 14px;
+      border-radius: 16px;
+      background: rgba(191, 161, 87, 0.1);
+      border: 1px solid rgba(191, 161, 87, 0.22);
+      color: #766131;
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .platform-notice.is-visible {
+      display: block;
+    }
+
     .history-head {
       display: flex;
       align-items: center;
@@ -1030,6 +1046,8 @@ HTML = """
         </div>
       </div>
 
+      <div id="platformNotice" class="platform-notice"></div>
+
       <div class="history-card">
         <div class="history-head">
           <div class="history-title">Historial reciente</div>
@@ -1094,6 +1112,7 @@ HTML = """
     const playPreviewBtn = document.getElementById('playPreviewBtn');
     const clearHistoryBtn = document.getElementById('clearHistoryBtn');
     const historyList = document.getElementById('historyList');
+    const platformNotice = document.getElementById('platformNotice');
     const previewCard = document.getElementById('previewCard');
     const mediaCard = document.getElementById('mediaCard');
     const platformBadge = document.getElementById('platformBadge');
@@ -1143,6 +1162,21 @@ HTML = """
 
     function getSafeUrl() {
       return (videoUrlInput.value || '').trim();
+    }
+
+    function isYouTubeUrl(url) {
+      return /youtu\.be|youtube\.com/i.test(url || '');
+    }
+
+    function updatePlatformNotice(url, message = '') {
+      if (isYouTubeUrl(url)) {
+        platformNotice.classList.add('is-visible');
+        platformNotice.textContent = message || 'Algunos videos de YouTube requieren autenticacion y no pueden procesarse desde servidores publicos. Si YouTube detecta trafico sospechoso, puede pedir cookies o inicio de sesion para continuar.';
+        return;
+      }
+
+      platformNotice.classList.remove('is-visible');
+      platformNotice.textContent = '';
     }
 
     function readHistory() {
@@ -1259,6 +1293,7 @@ HTML = """
           return;
         }
         videoUrlInput.value = clipboardText;
+        updatePlatformNotice(clipboardText);
         setStatus('success', 'Enlace pegado desde el portapapeles.');
       } catch (error) {
         setStatus('error', 'No se pudo leer el portapapeles. Revisa los permisos del navegador.');
@@ -1272,6 +1307,7 @@ HTML = """
         return;
       }
 
+      updatePlatformNotice(url);
       setStatus('loading', 'Obteniendo metadata del video...');
       previewCard.style.display = 'none';
 
@@ -1284,6 +1320,9 @@ HTML = """
 
         const data = await response.json();
         if (!response.ok || !data.ok) {
+          if (data.notice) {
+            updatePlatformNotice(url, data.notice);
+          }
           throw new Error(data.error || 'No se pudo procesar la URL.');
         }
 
@@ -1291,6 +1330,7 @@ HTML = """
         platformLogo.style.setProperty('--brand', data.platform.color || '#7dd3fc');
         platformLogo.innerHTML = `<i class="${data.platform.icon_class}"></i>`;
         platformName.textContent = data.platform.label;
+        updatePlatformNotice(url, data.notice || '');
         setPreviewLayout(data.preview_layout);
         currentPreview = {
           embedUrl: data.embed_url || '',
@@ -1405,6 +1445,7 @@ HTML = """
     });
 
     videoUrlInput.addEventListener('input', () => {
+      updatePlatformNotice(videoUrlInput.value);
       if (statusBox.classList.contains('error')) {
         clearStatus();
       }
@@ -1537,6 +1578,39 @@ def detect_preview_layout(platform_key: str, info: dict) -> str:
     if platform_key in {"instagram"}:
         return "square"
     return "landscape"
+
+
+def build_platform_notice(platform_key: str) -> Optional[str]:
+    """Devuelve una advertencia especifica para plataformas con restricciones conocidas."""
+    if platform_key == "youtube":
+        return (
+            "Algunos videos de YouTube requieren autenticacion y no pueden procesarse desde "
+            "servidores publicos. Si YouTube detecta trafico sospechoso, puede pedir cookies "
+            "o inicio de sesion para continuar."
+        )
+    return None
+
+
+def build_download_error_message(platform_key: str, exc: Exception) -> tuple[str, Optional[str]]:
+    """Convierte errores tecnicos del extractor en mensajes mas claros para la UI."""
+    raw_message = str(exc)
+    notice = build_platform_notice(platform_key)
+
+    if platform_key == "youtube" and "Sign in to confirm you’re not a bot" in raw_message:
+        return (
+            "YouTube bloqueo temporalmente esta consulta y pidio verificar que no eres un bot. "
+            "Ese video necesita autenticacion o cookies, por eso no se pudo analizar desde este servidor.",
+            notice,
+        )
+
+    if platform_key == "youtube" and "Sign in to confirm you're not a bot" in raw_message:
+        return (
+            "YouTube bloqueo temporalmente esta consulta y pidio verificar que no eres un bot. "
+            "Ese video necesita autenticacion o cookies, por eso no se pudo analizar desde este servidor.",
+            notice,
+        )
+
+    return (f"No se pudo procesar esta URL: {raw_message}", notice)
 
 
 def extract_video_info(url: str) -> dict:
@@ -1697,11 +1771,13 @@ def preview():
                 "embed_url": embed_url,
                 "preview_layout": preview_layout,
                 "ffmpeg_available": info.get("ffmpeg_available", False),
+                "notice": build_platform_notice(platform["key"]),
                 "qualities": info.get("qualities", []),
             }
         )
     except yt_dlp.utils.DownloadError as exc:
-        return jsonify({"ok": False, "error": f"No se pudo procesar esta URL: {str(exc)}"}), 400
+        message, notice = build_download_error_message(platform["key"], exc)
+        return jsonify({"ok": False, "error": message, "notice": notice}), 400
     except Exception:
         return jsonify({"ok": False, "error": "Ocurrió un error inesperado al analizar la URL."}), 500
 
