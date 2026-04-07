@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: practica-video-downloader
+    runtime: docker
+    plan: free
+    rootDir: practica
+    dockerContext: ./practica
+    dockerfilePath: ./practica/Dockerfile
+    healthCheckPath: /health
+    autoDeployTrigger: commit

@@ -14,8 +14,30 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_FOLDER = os.path.join(BASE_DIR, "downloads")
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+
+def resolve_download_folder() -> str:
+    """Usa una carpeta local si es escribible y cae a /tmp en despliegues serverless."""
+    configured = os.environ.get("DOWNLOAD_FOLDER")
+    candidates = [
+        configured,
+        os.path.join(BASE_DIR, "downloads"),
+        os.path.join(tempfile.gettempdir(), "video-downloader"),
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+
+    raise RuntimeError("No se pudo preparar una carpeta temporal para las descargas.")
+
+
+DOWNLOAD_FOLDER = resolve_download_folder()
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
 # Plataforma: nombre + ícono (emoji) + etiqueta visual
@@ -1612,6 +1634,11 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "ffmpeg_available": FFMPEG_AVAILABLE})
+
+
 @app.route("/thumbnail", methods=["GET"])
 def thumbnail_proxy():
     """Sirve la miniatura desde el backend para evitar bloqueos de carga en el navegador."""
@@ -1742,4 +1769,6 @@ def download():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+    app.run(host="0.0.0.0", port=port, debug=debug)
