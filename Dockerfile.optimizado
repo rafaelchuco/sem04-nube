@@ -1,0 +1,29 @@
+# Imagen más ligera
+FROM python:3.11-alpine
+
+# Instalar dependencias del sistema
+RUN apk add --no-cache gcc musl-dev linux-headers
+
+# Directorio de trabajo
+WORKDIR /app
+
+# Copiar dependencias primero (mejor cache)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar app
+COPY app.py .
+
+# Crear usuario seguro
+RUN adduser -D appuser && chown -R appuser /app
+USER appuser
+
+# Puerto
+EXPOSE 5000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000')" || exit 1
+
+# Ejecutar app
+CMD ["python", "app.py"]

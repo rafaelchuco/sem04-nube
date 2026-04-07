@@ -1,0 +1,27 @@
+# Etapa 1: builder
+FROM python:3.11-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev linux-headers
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Etapa 2: imagen final
+FROM python:3.11-alpine
+
+WORKDIR /app
+
+# Copiar solo lo necesario desde builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY app.py .
+
+# Seguridad
+RUN adduser -D appuser && chown -R appuser /app
+USER appuser
+
+EXPOSE 5000
+
+CMD ["python", "app.py"]
