@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS builder
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -21,6 +21,6 @@ RUN pip install --no-cache-dir /tmp/wheels/* && rm -rf /tmp/wheels
 
 COPY . .
 
-EXPOSE 5000
+EXPOSE 5001
 
 CMD ["xvfb-run", "-a", "python", "app.py"]
