@@ -167,16 +167,50 @@
         const miembro = data.es_miembro_mesa;
         const miembroTexto = miembro === true ? "SI" : miembro === false ? "NO" : "NO DISPONIBLE";
         const miembroClass = miembro === true ? "pill-ok" : "pill-no";
+        const campos =
+          miembro === true
+            ? [
+                ["Nombre", data.nombre],
+                ["Rol de mesa", data.rol_mesa],
+                ["Miembro de mesa", miembroTexto],
+                ["Región / Provincia / Distrito", data.region_provincia_distrito],
+                ["Ubicación del local", data.ubicacion_local],
+                ["Local de votación", data.local_votacion],
+                ["Dirección del local", data.direccion_local],
+                ["Referencia", data.referencia_local],
+                ["N° de Mesa", data.numero_mesa],
+                ["N° de Orden", data.numero_orden],
+                ["Pabellón", data.pabellon],
+                ["Piso", data.piso],
+                ["Aula", data.aula],
+              ]
+            : [
+                ["Miembro de mesa", miembroTexto],
+                ["Región / Provincia / Distrito", data.region_provincia_distrito],
+                ["Ubicación del local", data.ubicacion_local],
+                ["Local de votación", data.local_votacion],
+              ];
+
+        const detalleHtml = campos
+          .map(([label, value]) => {
+            const displayedValue = value || "No disponible";
+            return `
+              <div class="d-flex flex-column flex-md-row justify-content-between gap-1 border-bottom py-2">
+                <span class="fw-semibold">${escapeHtml(label)}</span>
+                <span class="text-md-end">${escapeHtml(displayedValue)}</span>
+              </div>
+            `;
+          })
+          .join("");
 
         resultado.innerHTML = `
           <div class="fade-in">
             <h2 class="h5 mb-3">Resultado de consulta</h2>
-            <p class="mb-2"><strong>Nombre:</strong> ${data.nombre || "No disponible"}</p>
-            <p class="mb-2 d-flex align-items-center gap-2">
+            <div class="mb-3 d-flex align-items-center gap-2">
               <strong>Miembro de mesa:</strong>
               <span class="badge rounded-pill ${miembroClass}">${miembroTexto}</span>
-            </p>
-            <p class="mb-0"><strong>Local de votacion:</strong> ${data.local_votacion || "No disponible"}</p>
+            </div>
+            <div>${detalleHtml}</div>
           </div>
         `;
 

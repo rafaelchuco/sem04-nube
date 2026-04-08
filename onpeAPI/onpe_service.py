@@ -20,6 +20,10 @@ class OnpeLookupError(Exception):
     """Error general al consultar ONPE."""
 
 
+class OnpeTemporaryError(OnpeLookupError):
+    """Error temporal de la web de ONPE que puede resolverse con reintento."""
+
+
 class CaptchaRequiredError(OnpeLookupError):
     """Se detecto captcha y no se pudo completar la consulta automaticamente."""
 
@@ -28,7 +32,17 @@ class CaptchaRequiredError(OnpeLookupError):
 class ParsedResult:
     nombre: str | None
     es_miembro_mesa: bool | None
-    local_votacion: str | None
+    rol_mesa: str | None = None
+    ubicacion_local: str | None = None
+    local_votacion: str | None = None
+    region_provincia_distrito: str | None = None
+    direccion_local: str | None = None
+    referencia_local: str | None = None
+    numero_mesa: str | None = None
+    numero_orden: str | None = None
+    pabellon: str | None = None
+    piso: str | None = None
+    aula: str | None = None
 
 
 class OnpePlaywrightClient:
@@ -119,7 +133,12 @@ class OnpePlaywrightClient:
             except Exception:
                 pass
 
-    def consultar_dni_playwright(self, dni: str, timeout_ms: int = 90000) -> dict[str, Any]:
+    def consultar_dni_playwright(
+        self,
+        dni: str,
+        timeout_ms: int = 90000,
+        _retry_on_closed: bool = True,
+    ) -> dict[str, Any]:
         """
         Consulta ONPE interactuando con la web publica y leyendo el estado desde el DOM.
 
@@ -135,21 +154,56 @@ class OnpePlaywrightClient:
                 page = context.new_page()
 
             try:
-                self._abrir_inicio_o_reutilizar(page, timeout_ms)
-                self._llenar_dni(page, dni)
-                self._click_consultar(page)
+                max_intentos = 3
+                parsed: ParsedResult | None = None
+                body_text = ""
 
-                parsed, body_text = self._esperar_estado_final(page, timeout_ms)
-                return {
+                for intento in range(1, max_intentos + 1):
+                    try:
+                        self._abrir_inicio_o_reutilizar(page, timeout_ms)
+                        self._llenar_dni(page, dni)
+                        self._click_consultar(page)
+                        parsed, body_text = self._esperar_estado_final(page, timeout_ms)
+                        break
+                    except OnpeTemporaryError:
+                        if intento == max_intentos:
+                            raise
+                        # Espera corta para que ONPE se estabilice y reintenta toda la secuencia.
+                        page.wait_for_timeout(1200 * intento)
+
+                if parsed is None:
+                    raise OnpeLookupError(
+                        "No se pudo obtener un resultado valido de ONPE tras varios intentos."
+                    )
+
+                response = {
                     "dni": dni,
-                    "nombre": parsed.nombre,
                     "es_miembro_mesa": parsed.es_miembro_mesa,
+                    "region_provincia_distrito": parsed.region_provincia_distrito,
+                    "ubicacion_local": parsed.ubicacion_local,
                     "local_votacion": parsed.local_votacion,
                     "onpe_response": {
                         "source": "dom",
                         "body_excerpt": body_text[:1200],
                     },
                 }
+
+                if parsed.es_miembro_mesa is True:
+                    response.update(
+                        {
+                            "nombre": parsed.nombre,
+                            "rol_mesa": parsed.rol_mesa,
+                            "direccion_local": parsed.direccion_local,
+                            "referencia_local": parsed.referencia_local,
+                            "numero_mesa": parsed.numero_mesa,
+                            "numero_orden": parsed.numero_orden,
+                            "pabellon": parsed.pabellon,
+                            "piso": parsed.piso,
+                            "aula": parsed.aula,
+                        }
+                    )
+
+                return response
             except CaptchaRequiredError:
                 self._store_manual_session(context, page)
                 raise
@@ -161,6 +215,17 @@ class OnpePlaywrightClient:
                     ) from exc
                 raise OnpeLookupError("La consulta excedio el tiempo de espera.") from exc
             except PlaywrightError as exc:
+                msg = str(exc).lower()
+                if _retry_on_closed and (
+                    "target page, context or browser has been closed" in msg
+                    or "browser has been closed" in msg
+                ):
+                    self._cleanup_manual_session()
+                    return self.consultar_dni_playwright(
+                        dni,
+                        timeout_ms=timeout_ms,
+                        _retry_on_closed=False,
+                    )
                 raise OnpeLookupError(f"Fallo de Playwright durante la consulta: {exc}") from exc
             finally:
                 if self._manual_page is page and self._manual_context is context:
@@ -200,7 +265,9 @@ class OnpePlaywrightClient:
 
         body_text = self._leer_texto_pagina(page).lower()
         if "error interno del servidor" in body_text:
-            raise OnpeLookupError("La web de ONPE abrio en 'Error interno del servidor'.")
+            raise OnpeTemporaryError("La web de ONPE abrio en 'Error interno del servidor'.")
+        if "pagina no encontrada" in body_text or "página no encontrada" in body_text:
+            raise OnpeTemporaryError("La web de ONPE abrio en 'Pagina no encontrada'.")
         raise OnpeLookupError("La web de ONPE no mostro el formulario de consulta.")
 
     def _esperar_formulario(self, page: Page, timeout_ms: int) -> bool:
@@ -227,9 +294,7 @@ class OnpePlaywrightClient:
             normalized = body_text.lower()
 
             parsed = self._parsear_resultado_desde_pagina(page)
-            if parsed and (
-                parsed.nombre or parsed.local_votacion or parsed.es_miembro_mesa is not None
-            ):
+            if parsed and self._resultado_consistente(parsed):
                 return parsed, body_text
 
             if "error interno del servidor" in normalized:
@@ -237,7 +302,14 @@ class OnpePlaywrightClient:
                     raise CaptchaRequiredError(
                         "ONPE mostro captcha y luego un error temporal. Resuelvelo en la ventana del navegador y vuelve a intentar."
                     )
-                raise OnpeLookupError("ONPE mostro 'Error interno del servidor' en la web.")
+                raise OnpeTemporaryError("ONPE mostro 'Error interno del servidor' en la web.")
+
+            if "pagina no encontrada" in normalized or "página no encontrada" in normalized:
+                if self._captcha_visible(page):
+                    raise CaptchaRequiredError(
+                        "ONPE mostro captcha y luego una pagina de error temporal. Resuelvelo en la ventana del navegador y vuelve a intentar."
+                    )
+                raise OnpeTemporaryError("ONPE mostro 'Pagina no encontrada' en la web.")
 
             if "captcha" in normalized or "no soy un robot" in normalized:
                 raise CaptchaRequiredError(
@@ -267,23 +339,9 @@ class OnpePlaywrightClient:
         try:
             root = page.locator("app-local-de-votacion").first
             if root.count() > 0:
-                nombre = self._texto_locator(root.locator(".nombre_apellido .apellido").first)
-                region = self._texto_locator(root.locator(".contenedor_local .local").first)
-                direccion = self._texto_locator(root.locator(".direccion_local .dato").first)
-                local = " - ".join(part for part in [region, direccion] if part)
-
-                miembro: bool | None = None
-                if root.locator("text=NO ERES MIEMBRO DE MESA").first.count() > 0:
-                    miembro = False
-                elif root.locator("text=ERES MIEMBRO DE MESA").first.count() > 0:
-                    miembro = True
-
-                if nombre or local or miembro is not None:
-                    return ParsedResult(
-                        nombre=nombre,
-                        es_miembro_mesa=miembro,
-                        local_votacion=local or None,
-                    )
+                parsed = self._parsear_resultado_desde_texto(root.inner_text(timeout=1500))
+                if parsed:
+                    return parsed
         except PlaywrightError:
             pass
 
@@ -296,27 +354,164 @@ class OnpePlaywrightClient:
         if not text:
             return None
 
+        return self._parsear_resultado_desde_texto(text)
+
+    def _parsear_resultado_desde_texto(self, text: str) -> ParsedResult | None:
+        if not text:
+            return None
+
         nombre_match = re.search(r"Nombres y Apellidos\s+([^\n]+)", text, flags=re.IGNORECASE)
-        local_match = re.search(r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+([^\n]+)", text, flags=re.IGNORECASE)
+        region_match = re.search(r"Regi[oó]n / Provincia / Distrito\s+([^\n]+)", text, flags=re.IGNORECASE)
+        local_match = re.search(
+            r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+([^\n]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        direccion_match = re.search(
+            r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+[^\n]+\s+([^\n]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        referencia_match = re.search(r"Referencia:\s*([^\n]+)", text, flags=re.IGNORECASE)
+        mesa_match = re.search(r"N[°ºo] de Mesa:\s*([0-9]+)", text, flags=re.IGNORECASE)
+        orden_match = re.search(r"N[°ºo] de Orden:\s*([0-9]+)", text, flags=re.IGNORECASE)
+        pabellon_match = re.search(r"Pabell[oó]n\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
+        piso_match = re.search(r"Piso\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
+        aula_match = re.search(r"Aula\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
 
         nombre = nombre_match.group(1).strip() if nombre_match else None
+        region = region_match.group(1).strip() if region_match else None
         local = local_match.group(1).strip() if local_match else None
+        direccion = direccion_match.group(1).strip() if direccion_match else None
+        referencia_local = referencia_match.group(1).strip() if referencia_match else None
+        numero_mesa = mesa_match.group(1).strip() if mesa_match else None
+        numero_orden = orden_match.group(1).strip() if orden_match else None
+        pabellon = pabellon_match.group(1).strip() if pabellon_match else None
+        piso = piso_match.group(1).strip() if piso_match else None
+        aula = aula_match.group(1).strip() if aula_match else None
 
-        miembro: bool | None = None
-        normalized_lines = [line.strip().upper() for line in text.splitlines() if line.strip()]
-        if "NO ERES MIEMBRO DE MESA" in normalized_lines:
-            miembro = False
-        elif "ERES MIEMBRO DE MESA" in normalized_lines:
-            miembro = True
+        es_miembro_mesa, rol_mesa = self._extraer_rol_mesa_texto(text)
 
-        if not nombre and not local and miembro is None:
+        # Si solo hay etiquetas sin valores reales, no consideramos que el resultado este listo.
+        valores_invalidos = {
+            "dni",
+            "nombres y apellidos",
+            "región / provincia / distrito",
+            "region / provincia / distrito",
+            "consultar",
+            "oficina central",
+        }
+        if nombre and nombre.strip().casefold() in valores_invalidos:
+            nombre = None
+        if region and region.strip().casefold() in valores_invalidos:
+            region = None
+        if local and local.strip().casefold() in valores_invalidos:
+            local = None
+        if direccion and direccion.strip().casefold() in valores_invalidos:
+            direccion = None
+
+        if not any(
+            [
+                nombre,
+                local,
+                direccion,
+                referencia_local,
+                numero_mesa,
+                numero_orden,
+                pabellon,
+                piso,
+                aula,
+                rol_mesa,
+                es_miembro_mesa is not None,
+            ]
+        ):
             return None
+
+        ubicacion_local = " - ".join(part for part in [region, local] if part)
 
         return ParsedResult(
             nombre=nombre,
-            es_miembro_mesa=miembro,
+            es_miembro_mesa=es_miembro_mesa,
+            rol_mesa=rol_mesa,
+            ubicacion_local=ubicacion_local or None,
             local_votacion=local,
+            region_provincia_distrito=region,
+            direccion_local=direccion,
+            referencia_local=referencia_local,
+            numero_mesa=numero_mesa,
+            numero_orden=numero_orden,
+            pabellon=pabellon,
+            piso=piso,
+            aula=aula,
         )
+
+    @staticmethod
+    def _resultado_consistente(parsed: ParsedResult) -> bool:
+        # Regla solicitada: o es miembro de mesa (con datos completos), o no lo es (con datos basicos).
+        if parsed.es_miembro_mesa is True:
+            return bool(parsed.rol_mesa and parsed.local_votacion and parsed.region_provincia_distrito)
+
+        if parsed.es_miembro_mesa is False:
+            return bool(parsed.local_votacion and parsed.region_provincia_distrito)
+
+        return False
+
+    @staticmethod
+    def _extraer_valor_seguidor(lines: list[str], etiqueta: str) -> str | None:
+        patron = re.compile(etiqueta, re.IGNORECASE)
+        for index, line in enumerate(lines):
+            if patron.fullmatch(line):
+                for siguiente in lines[index + 1 :]:
+                    valor = siguiente.strip()
+                    if valor:
+                        return valor
+                return None
+        return None
+
+    @staticmethod
+    def _extraer_valor_en_linea(lines: list[str], etiqueta: str) -> str | None:
+        patron = re.compile(etiqueta, re.IGNORECASE)
+        for line in lines:
+            match = patron.fullmatch(line)
+            if match and match.group(1):
+                valor = match.group(1).strip()
+                if valor:
+                    return valor
+        return None
+
+    @staticmethod
+    def _extraer_valores_seguidos(
+        lines: list[str],
+        etiqueta: str,
+        cantidad: int,
+        omitir: set[str] | None = None,
+    ) -> list[str]:
+        patron = re.compile(etiqueta, re.IGNORECASE)
+        omitidos = {value.strip().casefold() for value in (omitir or set())}
+        for index, line in enumerate(lines):
+            if patron.fullmatch(line):
+                valores: list[str] = []
+                for siguiente in lines[index + 1 :]:
+                    valor = siguiente.strip()
+                    if not valor or valor.casefold() in omitidos:
+                        continue
+                    valores.append(valor)
+                    if len(valores) >= cantidad:
+                        return valores
+                return valores
+        return []
+
+    @staticmethod
+    def _extraer_rol_mesa_texto(text: str) -> tuple[bool | None, str | None]:
+        if re.search(r"^NO ERES MIEMBRO DE MESA$", text, flags=re.IGNORECASE | re.MULTILINE):
+            return False, None
+
+        rol_match = re.search(r"^ERES\s+([^\n]+)$", text, flags=re.IGNORECASE | re.MULTILINE)
+        if rol_match:
+            rol = rol_match.group(1).strip()
+            if rol:
+                return True, rol
+        return None, None
 
     @staticmethod
     def _texto_locator(locator: Any) -> str | None:
@@ -429,9 +624,17 @@ class OnpePlaywrightClient:
                     break
 
         nombre = self._buscar_texto(data, ["nombreCompleto", "nombre_completo", "nombre", "nombres"])
+        rol_mesa = self._buscar_texto(
+            data,
+            ["rolMesa", "rol_mesa", "cargoMesa", "cargo_mesa", "cargo", "rol", "condicionMesa"],
+        )
         local = self._buscar_texto(
             data,
             ["localVotacion", "local_votacion", "local", "nombreLocal", "direccionLocal"],
+        )
+        region = self._buscar_texto(
+            data,
+            ["regionProvinciaDistrito", "region_provincia_distrito", "ubigeo", "zona"],
         )
 
         miembro_raw = self._buscar_valor(
@@ -440,10 +643,15 @@ class OnpePlaywrightClient:
         )
         miembro = self._normalizar_bool(miembro_raw)
 
+        ubicacion_local = " - ".join(part for part in [region, local] if part)
+
         return ParsedResult(
             nombre=nombre,
             es_miembro_mesa=miembro,
+            rol_mesa=rol_mesa,
+            ubicacion_local=ubicacion_local or None,
             local_votacion=local,
+            region_provincia_distrito=region,
         )
 
     @staticmethod

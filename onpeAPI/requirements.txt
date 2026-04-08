@@ -1,2 +1,2 @@
 flask
-playwright
+playwright==1.58.0

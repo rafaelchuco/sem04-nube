@@ -1,0 +1,26 @@
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+
+COPY requirements.txt ./
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY --from=builder /build/wheels /tmp/wheels
+RUN pip install --no-cache-dir /tmp/wheels/* && rm -rf /tmp/wheels
+
+COPY . .
+
+EXPOSE 5000
+
+CMD ["xvfb-run", "-a", "python", "app.py"]
