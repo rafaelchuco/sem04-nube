@@ -28,7 +28,11 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Reutiliza la misma instancia de navegador para evitar el costo de abrir Chromium por request.
-client = OnpePlaywrightClient(headless=_env_bool("ONPE_HEADLESS", default=False))
+client = OnpePlaywrightClient(
+    headless=_env_bool("ONPE_HEADLESS", default=False),
+    chrome_user_data_dir=os.getenv("ONPE_CHROME_USER_DATA_DIR"),
+    chrome_profile_dir=os.getenv("ONPE_CHROME_PROFILE_DIR"),
+)
 
 
 def _validar_dni(dni: str) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -48,16 +49,26 @@ class ParsedResult:
 class OnpePlaywrightClient:
     """Cliente Playwright reutilizable para consultas ONPE."""
 
-    def __init__(self, headless: bool = False):
+    def __init__(
+        self,
+        headless: bool = False,
+        chrome_user_data_dir: str | None = None,
+        chrome_profile_dir: str | None = None,
+    ):
         self.headless = headless
         self._playwright = None
         self._browser: Browser | None = None
+        self._persistent_context = None
         self._startup_lock = threading.Lock()
         self._consulta_lock = threading.Lock()
         self._manual_context = None
         self._manual_page: Page | None = None
+        self._chrome_user_data_dir = (
+            os.path.expanduser(chrome_user_data_dir) if chrome_user_data_dir else None
+        )
+        self._chrome_profile_dir = chrome_profile_dir
 
-    def _ensure_browser(self) -> Browser:
+    def _ensure_browser(self) -> Browser | None:
         if self._browser:
             return self._browser
 
@@ -66,13 +77,36 @@ class OnpePlaywrightClient:
                 return self._browser
 
             self._playwright = sync_playwright().start()
-            # Canal Chromium normal para que el usuario pueda interactuar si aparece reCAPTCHA.
-            self._browser = self._playwright.chromium.launch(headless=self.headless)
+
+            if self._chrome_user_data_dir:
+                launch_kwargs: dict[str, Any] = {
+                    "headless": self.headless,
+                    "channel": "chrome",
+                    "locale": "es-PE",
+                }
+                if self._chrome_profile_dir:
+                    launch_kwargs["args"] = [f"--profile-directory={self._chrome_profile_dir}"]
+
+                self._persistent_context = self._playwright.chromium.launch_persistent_context(
+                    self._chrome_user_data_dir,
+                    **launch_kwargs,
+                )
+                self._browser = self._persistent_context.browser
+            else:
+                # Canal Chromium normal para que el usuario pueda interactuar si aparece reCAPTCHA.
+                self._browser = self._playwright.chromium.launch(headless=self.headless)
+
             return self._browser
 
     def close(self) -> None:
         with self._startup_lock:
             self._cleanup_manual_session()
+            if self._persistent_context:
+                try:
+                    self._persistent_context.close()
+                except Exception:
+                    pass
+                self._persistent_context = None
             if self._browser:
                 try:
                     self._browser.close()
@@ -87,6 +121,16 @@ class OnpePlaywrightClient:
                     pass
                 self._playwright = None
 
+    def _is_persistent_context(self, context: Any | None) -> bool:
+        return bool(context is not None and context is self._persistent_context)
+
+    def _create_context(self, browser: Browser | None) -> Any:
+        if self._persistent_context is not None:
+            return self._persistent_context
+        if browser is None:
+            raise OnpeLookupError("No se pudo iniciar el navegador para la consulta ONPE.")
+        return browser.new_context(locale="es-PE")
+
     def _take_manual_session(self) -> tuple[Any | None, Page | None]:
         context = self._manual_context
         page = self._manual_page
@@ -98,11 +142,13 @@ class OnpePlaywrightClient:
 
         try:
             if page.is_closed():
-                context.close()
+                if not self._is_persistent_context(context):
+                    context.close()
                 return None, None
         except Exception:
             try:
-                context.close()
+                if not self._is_persistent_context(context):
+                    context.close()
             except Exception:
                 pass
             return None, None
@@ -129,7 +175,8 @@ class OnpePlaywrightClient:
 
         if context:
             try:
-                context.close()
+                if not self._is_persistent_context(context):
+                    context.close()
             except Exception:
                 pass
 
@@ -150,7 +197,7 @@ class OnpePlaywrightClient:
         with self._consulta_lock:
             context, page = self._take_manual_session()
             if context is None or page is None:
-                context = browser.new_context(locale="es-PE")
+                context = self._create_context(browser)
                 page = context.new_page()
 
             try:
@@ -234,7 +281,8 @@ class OnpePlaywrightClient:
                         pass
 
                     try:
-                        context.close()
+                        if not self._is_persistent_context(context):
+                            context.close()
                     except Exception:
                         pass
 
@@ -242,16 +290,28 @@ class OnpePlaywrightClient:
         """
         Prepara una sesion humana antes del lote para que el captcha se resuelva
         una sola vez y los siguientes DNIs aprovechen la misma sesion.
+
+        Primero carga una busqueda de Google con el mensaje de advertencia que
+        aparece en la ventana, y luego continua automaticamente hacia ONPE.
         """
         browser = self._ensure_browser()
 
         with self._consulta_lock:
-            context, page = self._take_manual_session()
-            if context is None or page is None:
-                context = browser.new_context(locale="es-PE")
-                page = context.new_page()
+            context, _ = self._take_manual_session()
+            if context is None:
+                context = self._create_context(browser)
+
+            # Abre una nueva pestana real en el mismo navegador/sesion (equivalente a Ctrl+T).
+            page = context.new_page()
 
             try:
+                google_search = (
+                    "https://www.google.com/search?q=Hola+primero+marque+el+captcha+y+despues+continue+con+el+proceso"
+                    "&oq=Hola+primero+marque+el+captcha+y+despues+continue+con+el+proceso&gs_lcrp=EgZjaHJvbWUyBggAEEUYOTIGCAEQLhhA0gEJMjQwNzJqMGoxqAIAsAIA&sourceid=chrome&ie=UTF-8"
+                )
+                page.goto(google_search, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_timeout(1200)
+
                 self._abrir_inicio_o_reutilizar(page, timeout_ms)
 
                 # Dispara una consulta de prueba para que ONPE solicite captcha al inicio
@@ -264,6 +324,10 @@ class OnpePlaywrightClient:
 
                 # Guarda la sesion para que el siguiente DNI del lote la reutilice.
                 self._store_manual_session(context, page)
+            except CaptchaRequiredError:
+                # Mantiene la pestana abierta para que el usuario resuelva captcha.
+                self._store_manual_session(context, page)
+                raise
             except Exception:
                 try:
                     if not page.is_closed():
@@ -272,7 +336,8 @@ class OnpePlaywrightClient:
                     pass
 
                 try:
-                    context.close()
+                    if not self._is_persistent_context(context):
+                        context.close()
                 except Exception:
                     pass
                 raise
