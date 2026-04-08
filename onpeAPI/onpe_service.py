@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,8 +14,6 @@ from playwright.sync_api import (
 )
 
 ONPE_URL = "https://consultaelectoral.onpe.gob.pe/inicio"
-API_PATH_BUSQUEDA_DNI = "/v1/api/busqueda/dni"
-API_PATH_RESULTADO_DEFINITIVO = "/v1/api/consulta/definitiva"
 
 
 class OnpeLookupError(Exception):
@@ -43,6 +40,8 @@ class OnpePlaywrightClient:
         self._browser: Browser | None = None
         self._startup_lock = threading.Lock()
         self._consulta_lock = threading.Lock()
+        self._manual_context = None
+        self._manual_page: Page | None = None
 
     def _ensure_browser(self) -> Browser:
         if self._browser:
@@ -59,6 +58,7 @@ class OnpePlaywrightClient:
 
     def close(self) -> None:
         with self._startup_lock:
+            self._cleanup_manual_session()
             if self._browser:
                 try:
                     self._browser.close()
@@ -73,9 +73,55 @@ class OnpePlaywrightClient:
                     pass
                 self._playwright = None
 
+    def _take_manual_session(self) -> tuple[Any | None, Page | None]:
+        context = self._manual_context
+        page = self._manual_page
+        self._manual_context = None
+        self._manual_page = None
+
+        if not context or not page:
+            return None, None
+
+        try:
+            if page.is_closed():
+                context.close()
+                return None, None
+        except Exception:
+            try:
+                context.close()
+            except Exception:
+                pass
+            return None, None
+
+        return context, page
+
+    def _store_manual_session(self, context: Any, page: Page) -> None:
+        self._cleanup_manual_session()
+        self._manual_context = context
+        self._manual_page = page
+
+    def _cleanup_manual_session(self) -> None:
+        page = self._manual_page
+        context = self._manual_context
+        self._manual_page = None
+        self._manual_context = None
+
+        if page:
+            try:
+                if not page.is_closed():
+                    page.close()
+            except Exception:
+                pass
+
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+
     def consultar_dni_playwright(self, dni: str, timeout_ms: int = 90000) -> dict[str, Any]:
         """
-        Consulta ONPE e intercepta la respuesta de red de la API interna.
+        Consulta ONPE interactuando con la web publica y leyendo el estado desde el DOM.
 
         Si aparece reCAPTCHA, deja la ventana abierta (headless=False) para resolverlo manualmente.
         """
@@ -83,120 +129,226 @@ class OnpePlaywrightClient:
 
         # Serializa consultas para minimizar bloqueos por anti-bot y facilitar captcha manual.
         with self._consulta_lock:
-            context = browser.new_context(locale="es-PE")
-            page = context.new_page()
-
-            captured: dict[str, Any] = {}
-            captcha_visto = {"value": False}
-
-            def on_response(response):
-                if API_PATH_BUSQUEDA_DNI not in response.url and API_PATH_RESULTADO_DEFINITIVO not in response.url:
-                    return
-
-                payload: dict[str, Any]
-                try:
-                    payload = response.json()
-                except PlaywrightError:
-                    try:
-                        payload = {"raw": response.text()}
-                    except PlaywrightError:
-                        payload = {
-                            "raw": None,
-                            "error": "No se pudo leer el body de la respuesta ONPE.",
-                        }
-
-                if API_PATH_BUSQUEDA_DNI in response.url:
-                    captured["busqueda"] = {
-                        "status": response.status,
-                        "url": response.url,
-                        "body": payload,
-                    }
-
-                if API_PATH_RESULTADO_DEFINITIVO in response.url:
-                    captured["definitiva"] = {
-                        "status": response.status,
-                        "url": response.url,
-                        "body": payload,
-                    }
-
-            page.on("response", on_response)
+            context, page = self._take_manual_session()
+            if context is None or page is None:
+                context = browser.new_context(locale="es-PE")
+                page = context.new_page()
 
             try:
-                page.goto(ONPE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_load_state("networkidle")
-
+                self._abrir_inicio_o_reutilizar(page, timeout_ms)
                 self._llenar_dni(page, dni)
                 self._click_consultar(page)
 
-                start = time.monotonic()
-                timeout_s = timeout_ms / 1000
-
-                while "definitiva" not in captured and (time.monotonic() - start) < timeout_s:
-                    if self._captcha_visible(page):
-                        captcha_visto["value"] = True
-                    # Espera corta cooperativa del propio Playwright (sin time.sleep).
-                    page.wait_for_timeout(300)
-
-                if "definitiva" not in captured:
-                    # Si hubo respuesta de busqueda con error, devolvemos ese detalle.
-                    if "busqueda" in captured:
-                        mensaje_busqueda = self._extraer_mensaje_error(captured["busqueda"]["body"])
-                        if mensaje_busqueda:
-                            raise OnpeLookupError(f"ONPE (busqueda DNI): {mensaje_busqueda}")
-
-                    if captcha_visto["value"]:
-                        raise CaptchaRequiredError(
-                            "Se detecto reCAPTCHA. Resuelvelo manualmente en la ventana abierta y vuelve a intentar."
-                        )
-                    raise OnpeLookupError(
-                        "No se pudo capturar el resultado definitivo de ONPE. Verifica captcha o cambios en la UI."
-                    )
-
-                respuesta_final = captured["definitiva"]["body"]
-                mensaje_error = self._extraer_mensaje_error(respuesta_final)
-                success_final = self._extraer_success(respuesta_final)
-                if mensaje_error:
-                    mensaje_norm = mensaje_error.lower()
-                    # Si success=true y hay mensaje, no lo tratamos como error fatal.
-                    if success_final is True:
-                        mensaje_error = None
-                        mensaje_norm = ""
-                    if "captcha" in mensaje_norm:
-                        raise CaptchaRequiredError(
-                            "ONPE solicito verificacion captcha. Resuelvelo en la ventana del navegador y vuelve a consultar."
-                        )
-                    if "formato" in mensaje_norm and "dni" in mensaje_norm:
-                        raise OnpeLookupError(
-                            "ONPE rechazo el formato del DNI. Verifica que ingreses 8 digitos y vuelve a intentar."
-                        )
-                    if "formato solicitado" in mensaje_norm:
-                        raise OnpeLookupError(
-                            "ONPE rechazo la solicitud por formato. Reintenta la consulta y, si aparece captcha, resuelvelo manualmente."
-                        )
-                    if mensaje_error:
-                        raise OnpeLookupError(f"ONPE respondio con error: {mensaje_error}")
-
-                parsed = self._parsear_resultado(respuesta_final)
+                parsed, body_text = self._esperar_estado_final(page, timeout_ms)
                 return {
                     "dni": dni,
                     "nombre": parsed.nombre,
                     "es_miembro_mesa": parsed.es_miembro_mesa,
                     "local_votacion": parsed.local_votacion,
-                    "onpe_response": respuesta_final,
+                    "onpe_response": {
+                        "source": "dom",
+                        "body_excerpt": body_text[:1200],
+                    },
                 }
+            except CaptchaRequiredError:
+                self._store_manual_session(context, page)
+                raise
             except PlaywrightTimeoutError as exc:
+                if self._captcha_visible(page):
+                    self._store_manual_session(context, page)
+                    raise CaptchaRequiredError(
+                        "Se detecto reCAPTCHA. Resuelvelo manualmente en la ventana abierta y vuelve a intentar."
+                    ) from exc
                 raise OnpeLookupError("La consulta excedio el tiempo de espera.") from exc
             except PlaywrightError as exc:
                 raise OnpeLookupError(f"Fallo de Playwright durante la consulta: {exc}") from exc
             finally:
-                page.remove_listener("response", on_response)
-                page.close()
-                context.close()
+                if self._manual_page is page and self._manual_context is context:
+                    pass
+                else:
+                    try:
+                        if not page.is_closed():
+                            page.close()
+                    except Exception:
+                        pass
+
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+    def _abrir_inicio_o_reutilizar(self, page: Page, timeout_ms: int) -> None:
+        try:
+            current_url = page.url
+        except PlaywrightError:
+            current_url = ""
+
+        if current_url.startswith(ONPE_URL):
+            if self._esperar_formulario(page, timeout_ms=8000):
+                return
+
+        max_intentos = 3
+        for intento in range(1, max_intentos + 1):
+            try:
+                page.goto(ONPE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+            except PlaywrightError:
+                if intento == max_intentos:
+                    raise
+            if self._esperar_formulario(page, timeout_ms=6000):
+                return
+            page.wait_for_timeout(800 * intento)
+
+        body_text = self._leer_texto_pagina(page).lower()
+        if "error interno del servidor" in body_text:
+            raise OnpeLookupError("La web de ONPE abrio en 'Error interno del servidor'.")
+        raise OnpeLookupError("La web de ONPE no mostro el formulario de consulta.")
+
+    def _esperar_formulario(self, page: Page, timeout_ms: int) -> bool:
+        waited = 0
+        while waited < timeout_ms:
+            if self._pagina_inicio_lista(page):
+                return True
+            page.wait_for_timeout(500)
+            waited += 500
+
+        return self._pagina_inicio_lista(page)
+
+    def _pagina_inicio_lista(self, page: Page) -> bool:
+        try:
+            return page.locator("input[placeholder*='DNI' i]").first.is_visible(timeout=1200)
+        except PlaywrightError:
+            return False
+
+    def _esperar_estado_final(self, page: Page, timeout_ms: int) -> tuple[ParsedResult, str]:
+        deadline = timeout_ms
+        started = 0
+        while started < deadline:
+            body_text = self._leer_texto_pagina(page)
+            normalized = body_text.lower()
+
+            parsed = self._parsear_resultado_desde_pagina(page)
+            if parsed and (
+                parsed.nombre or parsed.local_votacion or parsed.es_miembro_mesa is not None
+            ):
+                return parsed, body_text
+
+            if "error interno del servidor" in normalized:
+                if self._captcha_visible(page):
+                    raise CaptchaRequiredError(
+                        "ONPE mostro captcha y luego un error temporal. Resuelvelo en la ventana del navegador y vuelve a intentar."
+                    )
+                raise OnpeLookupError("ONPE mostro 'Error interno del servidor' en la web.")
+
+            if "captcha" in normalized or "no soy un robot" in normalized:
+                raise CaptchaRequiredError(
+                    "Se detecto reCAPTCHA. Resuelvelo manualmente en la ventana abierta y vuelve a intentar."
+                )
+
+            if "formato" in normalized and "dni" in normalized:
+                raise OnpeLookupError(
+                    "ONPE rechazo el formato del DNI. Verifica que ingreses 8 digitos y vuelve a intentar."
+                )
+
+            page.wait_for_timeout(500)
+            started += 500
+
+        raise PlaywrightTimeoutError("Tiempo de espera agotado al observar la web de ONPE.")
+
+    @staticmethod
+    def _leer_texto_pagina(page: Page) -> str:
+        try:
+            return page.locator("body").inner_text(timeout=1500)
+        except PlaywrightError:
+            return ""
+
+    def _parsear_resultado_desde_pagina(self, page: Page) -> ParsedResult | None:
+        """Fallback por DOM cuando ONPE no expone el JSON de respuesta."""
+        # Primero usamos la estructura actual de la vista de resultado de ONPE.
+        try:
+            root = page.locator("app-local-de-votacion").first
+            if root.count() > 0:
+                nombre = self._texto_locator(root.locator(".nombre_apellido .apellido").first)
+                region = self._texto_locator(root.locator(".contenedor_local .local").first)
+                direccion = self._texto_locator(root.locator(".direccion_local .dato").first)
+                local = " - ".join(part for part in [region, direccion] if part)
+
+                miembro: bool | None = None
+                if root.locator("text=NO ERES MIEMBRO DE MESA").first.count() > 0:
+                    miembro = False
+                elif root.locator("text=ERES MIEMBRO DE MESA").first.count() > 0:
+                    miembro = True
+
+                if nombre or local or miembro is not None:
+                    return ParsedResult(
+                        nombre=nombre,
+                        es_miembro_mesa=miembro,
+                        local_votacion=local or None,
+                    )
+        except PlaywrightError:
+            pass
+
+        # Fallback textual por si ONPE cambia ligeramente la maqueta.
+        try:
+            text = page.inner_text("body")
+        except PlaywrightError:
+            return None
+
+        if not text:
+            return None
+
+        nombre_match = re.search(r"Nombres y Apellidos\s+([^\n]+)", text, flags=re.IGNORECASE)
+        local_match = re.search(r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+([^\n]+)", text, flags=re.IGNORECASE)
+
+        nombre = nombre_match.group(1).strip() if nombre_match else None
+        local = local_match.group(1).strip() if local_match else None
+
+        miembro: bool | None = None
+        normalized_lines = [line.strip().upper() for line in text.splitlines() if line.strip()]
+        if "NO ERES MIEMBRO DE MESA" in normalized_lines:
+            miembro = False
+        elif "ERES MIEMBRO DE MESA" in normalized_lines:
+            miembro = True
+
+        if not nombre and not local and miembro is None:
+            return None
+
+        return ParsedResult(
+            nombre=nombre,
+            es_miembro_mesa=miembro,
+            local_votacion=local,
+        )
+
+    @staticmethod
+    def _texto_locator(locator: Any) -> str | None:
+        try:
+            text = locator.inner_text(timeout=1000).strip()
+        except PlaywrightError:
+            return None
+        return text or None
+
+    @staticmethod
+    def _safe_response_payload(response: Any) -> dict[str, Any]:
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+            return {"raw": payload}
+        except PlaywrightError:
+            try:
+                return {"raw": response.text()}
+            except PlaywrightError:
+                return {
+                    "raw": None,
+                    "error": "No se pudo leer el body de la respuesta ONPE.",
+                }
 
     def _llenar_dni(self, page: Page, dni: str) -> None:
         """Busca el input DNI con varios selectores robustos para tolerar cambios de UI."""
         candidatos = [
-            # Selectores observados en ONPE (input tel con placeholder Numero de DNI)
+            # Selectores exactos observados en la vista Angular de ONPE.
+            page.locator("app-c-input[formcontrolname='numeroDocumento'] input").first,
+            page.locator("input[placeholder='Número de DNI']").first,
+            page.locator("input[placeholder='Numero de DNI']").first,
             page.locator("input[placeholder*='DNI' i]").first,
             page.locator("input[type='tel']").first,
             page.locator("input[required][maxlength='8']").first,
@@ -233,6 +385,7 @@ class OnpePlaywrightClient:
     def _click_consultar(self, page: Page) -> None:
         botones = [
             page.locator("button.button_consulta").first,
+            page.locator("button.button_estilo4.button_consulta").first,
             page.get_by_role("button", name=re.compile("consultar", re.IGNORECASE)).first,
             page.get_by_text(re.compile("consultar", re.IGNORECASE)).first,
             page.locator("button[type='submit']").first,

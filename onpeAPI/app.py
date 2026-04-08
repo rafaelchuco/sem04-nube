@@ -58,11 +58,17 @@ def consultar_dni():
             HTTPStatus.CONFLICT,
         )
     except OnpeLookupError as exc:
+        msg = str(exc)
+        if "500" in msg or "interno del servidor" in msg.lower():
+            msg = (
+                "ONPE devolvio un error interno temporal. Intenta nuevamente en unos segundos "
+                "o resuelve captcha si aparece en la ventana del navegador."
+            )
         return (
             jsonify(
                 {
                     "ok": False,
-                    "error": str(exc),
+                    "error": msg,
                     "code": "lookup_error",
                 }
             ),

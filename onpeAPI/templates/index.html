@@ -112,6 +112,26 @@
         <div id="alertZone" class="mt-3" aria-live="polite"></div>
 
         <article id="resultado" class="result-card rounded-3 p-4 mt-4 d-none"></article>
+
+        <hr class="my-4" />
+
+        <section>
+          <h2 class="h5 mb-3">Consulta por archivo (lote)</h2>
+          <p class="text-muted small mb-3">
+            Sube un archivo <code>.txt</code> o <code>.csv</code> con DNIs (8 digitos) separados por linea, coma, punto y coma o espacio.
+          </p>
+          <form id="loteForm" class="row g-3" novalidate>
+            <div class="col-12 col-md-8">
+              <label for="archivoInput" class="form-label">Archivo de DNIs</label>
+              <input id="archivoInput" class="form-control" type="file" accept=".txt,.csv" required />
+            </div>
+            <div class="col-12 col-md-4 d-flex align-items-end">
+              <button id="loteBtn" class="btn btn-outline-primary w-100" type="submit">Procesar lote</button>
+            </div>
+          </form>
+          <div id="loteAlertZone" class="mt-3" aria-live="polite"></div>
+          <div id="loteResultado" class="mt-3 d-none"></div>
+        </section>
       </section>
     </main>
 
@@ -121,6 +141,11 @@
       const alertZone = document.getElementById("alertZone");
       const resultado = document.getElementById("resultado");
       const consultarBtn = document.getElementById("consultarBtn");
+      const loteForm = document.getElementById("loteForm");
+      const archivoInput = document.getElementById("archivoInput");
+      const loteBtn = document.getElementById("loteBtn");
+      const loteAlertZone = document.getElementById("loteAlertZone");
+      const loteResultado = document.getElementById("loteResultado");
 
       function setAlert(message, type = "danger") {
         alertZone.innerHTML = `<div class="alert alert-${type} fade-in" role="alert">${message}</div>`;
@@ -128,6 +153,14 @@
 
       function clearAlert() {
         alertZone.innerHTML = "";
+      }
+
+      function setLoteAlert(message, type = "danger") {
+        loteAlertZone.innerHTML = `<div class="alert alert-${type} fade-in" role="alert">${message}</div>`;
+      }
+
+      function clearLoteAlert() {
+        loteAlertZone.innerHTML = "";
       }
 
       function renderResultado(data) {
@@ -186,6 +219,106 @@
         } finally {
           consultarBtn.disabled = false;
           consultarBtn.textContent = "Consultar";
+        }
+      });
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+
+      function renderLoteResultado(payload) {
+        const rows = (payload.resultados || [])
+          .map((item) => {
+            const miembro = item.es_miembro_mesa;
+            const miembroTexto = miembro === true ? "SI" : miembro === false ? "NO" : "NO DISPONIBLE";
+            const estado = item.ok ? "OK" : "ERROR";
+            const detalle = item.ok
+              ? escapeHtml(item.local_votacion || "No disponible")
+              : escapeHtml(item.error || "Sin detalle");
+            return `
+              <tr>
+                <td>${escapeHtml(item.dni)}</td>
+                <td>${escapeHtml(estado)}</td>
+                <td>${escapeHtml(item.nombre || "No disponible")}</td>
+                <td>${escapeHtml(miembroTexto)}</td>
+                <td>${detalle}</td>
+              </tr>
+            `;
+          })
+          .join("");
+
+        loteResultado.innerHTML = `
+          <div class="card fade-in">
+            <div class="card-body">
+              <h3 class="h6 mb-3">Resultado del lote</h3>
+              <p class="mb-3">
+                <strong>Total:</strong> ${payload.total || 0}
+                <span class="mx-2">|</span>
+                <strong>Procesados:</strong> ${payload.procesados || 0}
+              </p>
+              <div class="table-responsive">
+                <table class="table table-sm table-striped align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>DNI</th>
+                      <th>Estado</th>
+                      <th>Nombre</th>
+                      <th>Miembro de mesa</th>
+                      <th>Local / Error</th>
+                    </tr>
+                  </thead>
+                  <tbody>${rows}</tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        `;
+        loteResultado.classList.remove("d-none");
+      }
+
+      loteForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const archivo = archivoInput.files && archivoInput.files[0];
+
+        if (!archivo) {
+          setLoteAlert("Selecciona un archivo .txt o .csv con DNIs.", "warning");
+          loteResultado.classList.add("d-none");
+          return;
+        }
+
+        clearLoteAlert();
+        loteBtn.disabled = true;
+        loteBtn.textContent = "Procesando...";
+
+        try {
+          const formData = new FormData();
+          formData.append("archivo", archivo);
+
+          const response = await fetch("/consultar-lote", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+
+          if (!response.ok || !data.ok) {
+            setLoteAlert(data.error || "No fue posible procesar el archivo.", "danger");
+            loteResultado.classList.add("d-none");
+            return;
+          }
+
+          renderLoteResultado(data);
+          setLoteAlert("Consulta por lote finalizada.", "success");
+        } catch (error) {
+          setLoteAlert("Error de red o del servidor al procesar el lote.", "danger");
+          loteResultado.classList.add("d-none");
+        } finally {
+          loteBtn.disabled = false;
+          loteBtn.textContent = "Procesar lote";
         }
       });
     </script>
