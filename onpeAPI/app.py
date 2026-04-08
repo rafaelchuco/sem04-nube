@@ -116,7 +116,24 @@ def _procesar_lote_desde_contenido(contenido: str) -> tuple[list[str], list[dict
     dnis = _extraer_dnis_desde_texto(contenido)
     resultados: list[dict[str, object]] = []
 
+    if dnis:
+        try:
+            client.preparar_sesion_lote()
+        except CaptchaRequiredError as exc:
+            # Si no se resuelve captcha en esta fase, continuamos igual y
+            # cada DNI devolvera detalle explicito para el usuario.
+            resultados.append(
+                {
+                    "dni": dnis[0],
+                    "ok": False,
+                    "error": str(exc),
+                    "code": "captcha_required",
+                }
+            )
+
     for dni in dnis:
+        if any(item.get("dni") == dni for item in resultados):
+            continue
         try:
             data = client.consultar_dni_playwright(dni)
             resultados.append({"dni": dni, "ok": True, **data})

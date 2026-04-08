@@ -198,6 +198,11 @@ class OnpePlaywrightClient:
                 }
 
                 return response
+            except CaptchaRequiredError:
+                # Conserva la sesion/pagina para que el usuario resuelva captcha
+                # y el siguiente intento reutilice exactamente la misma vista.
+                self._store_manual_session(context, page)
+                raise
             except PlaywrightTimeoutError as exc:
                 if self._captcha_visible(page):
                     self._store_manual_session(context, page)
@@ -232,6 +237,45 @@ class OnpePlaywrightClient:
                         context.close()
                     except Exception:
                         pass
+
+    def preparar_sesion_lote(self, timeout_ms: int = 150000) -> None:
+        """
+        Prepara una sesion humana antes del lote para que el captcha se resuelva
+        una sola vez y los siguientes DNIs aprovechen la misma sesion.
+        """
+        browser = self._ensure_browser()
+
+        with self._consulta_lock:
+            context, page = self._take_manual_session()
+            if context is None or page is None:
+                context = browser.new_context(locale="es-PE")
+                page = context.new_page()
+
+            try:
+                self._abrir_inicio_o_reutilizar(page, timeout_ms)
+
+                # Dispara una consulta de prueba para que ONPE solicite captcha al inicio
+                # en vez de interrumpir repetidamente cada DNI del lote.
+                self._llenar_dni(page, "00000000")
+                self._click_consultar(page)
+
+                if self._captcha_visible(page):
+                    self._esperar_resolucion_captcha(page, timeout_ms)
+
+                # Guarda la sesion para que el siguiente DNI del lote la reutilice.
+                self._store_manual_session(context, page)
+            except Exception:
+                try:
+                    if not page.is_closed():
+                        page.close()
+                except Exception:
+                    pass
+
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                raise
 
     def _abrir_inicio_o_reutilizar(self, page: Page, timeout_ms: int) -> None:
         try:
@@ -667,6 +711,18 @@ class OnpePlaywrightClient:
             except PlaywrightError:
                 continue
         return False
+
+    def _esperar_resolucion_captcha(self, page: Page, timeout_ms: int) -> None:
+        waited = 0
+        while waited < timeout_ms:
+            if not self._captcha_visible(page):
+                return
+            page.wait_for_timeout(700)
+            waited += 700
+
+        raise CaptchaRequiredError(
+            "Captcha detectado al iniciar el lote. Resuelvelo en la ventana del navegador y vuelve a intentar."
+        )
 
     def _parsear_resultado(self, payload: Any) -> ParsedResult:
         """Normaliza datos principales aunque cambie ligeramente la estructura del JSON."""
