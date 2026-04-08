@@ -125,8 +125,9 @@
               <label for="archivoInput" class="form-label">Archivo de DNIs</label>
               <input id="archivoInput" class="form-control" type="file" accept=".txt,.csv" required />
             </div>
-            <div class="col-12 col-md-4 d-flex align-items-end">
+            <div class="col-12 col-md-4 d-flex flex-column gap-2 align-items-stretch justify-content-end">
               <button id="loteBtn" class="btn btn-outline-primary w-100" type="submit">Procesar lote</button>
+              <button id="excelBtn" class="btn btn-brand w-100" type="button">Descargar Excel</button>
             </div>
           </form>
           <div id="loteAlertZone" class="mt-3" aria-live="polite"></div>
@@ -144,6 +145,7 @@
       const loteForm = document.getElementById("loteForm");
       const archivoInput = document.getElementById("archivoInput");
       const loteBtn = document.getElementById("loteBtn");
+      const excelBtn = document.getElementById("excelBtn");
       const loteAlertZone = document.getElementById("loteAlertZone");
       const loteResultado = document.getElementById("loteResultado");
 
@@ -163,33 +165,43 @@
         loteAlertZone.innerHTML = "";
       }
 
+      function setLoteButtonsDisabled(disabled, processingLabel = "Procesando...") {
+        loteBtn.disabled = disabled;
+        excelBtn.disabled = disabled;
+        loteBtn.textContent = disabled ? processingLabel : "Procesar lote";
+        excelBtn.textContent = disabled ? processingLabel : "Descargar Excel";
+      }
+
+      function buildLoteFormData() {
+        const archivo = archivoInput.files && archivoInput.files[0];
+        if (!archivo) {
+          return null;
+        }
+
+        const formData = new FormData();
+        formData.append("archivo", archivo);
+        return formData;
+      }
+
       function renderResultado(data) {
         const miembro = data.es_miembro_mesa;
         const miembroTexto = miembro === true ? "SI" : miembro === false ? "NO" : "NO DISPONIBLE";
         const miembroClass = miembro === true ? "pill-ok" : "pill-no";
-        const campos =
-          miembro === true
-            ? [
-                ["Nombre", data.nombre],
-                ["Rol de mesa", data.rol_mesa],
-                ["Miembro de mesa", miembroTexto],
-                ["Región / Provincia / Distrito", data.region_provincia_distrito],
-                ["Ubicación del local", data.ubicacion_local],
-                ["Local de votación", data.local_votacion],
-                ["Dirección del local", data.direccion_local],
-                ["Referencia", data.referencia_local],
-                ["N° de Mesa", data.numero_mesa],
-                ["N° de Orden", data.numero_orden],
-                ["Pabellón", data.pabellon],
-                ["Piso", data.piso],
-                ["Aula", data.aula],
-              ]
-            : [
-                ["Miembro de mesa", miembroTexto],
-                ["Región / Provincia / Distrito", data.region_provincia_distrito],
-                ["Ubicación del local", data.ubicacion_local],
-                ["Local de votación", data.local_votacion],
-              ];
+        const campos = [
+          ["Nombre", data.nombre],
+          ["Miembro de mesa", miembroTexto],
+          ["Rol de mesa", data.rol_mesa],
+          ["Región / Provincia / Distrito", data.region_provincia_distrito],
+          ["Ubicación del local", data.ubicacion_local],
+          ["Local de votación", data.local_votacion],
+          ["Dirección del local", data.direccion_local],
+          ["Referencia", data.referencia_local],
+          ["N° de Mesa", data.numero_mesa],
+          ["N° de Orden", data.numero_orden],
+          ["Pabellón", data.pabellon],
+          ["Piso", data.piso],
+          ["Aula", data.aula],
+        ];
 
         const detalleHtml = campos
           .map(([label, value]) => {
@@ -317,22 +329,18 @@
 
       loteForm.addEventListener("submit", async (event) => {
         event.preventDefault();
-        const archivo = archivoInput.files && archivoInput.files[0];
 
-        if (!archivo) {
+        const formData = buildLoteFormData();
+        if (!formData) {
           setLoteAlert("Selecciona un archivo .txt o .csv con DNIs.", "warning");
           loteResultado.classList.add("d-none");
           return;
         }
 
         clearLoteAlert();
-        loteBtn.disabled = true;
-        loteBtn.textContent = "Procesando...";
+        setLoteButtonsDisabled(true);
 
         try {
-          const formData = new FormData();
-          formData.append("archivo", archivo);
-
           const response = await fetch("/consultar-lote", {
             method: "POST",
             body: formData,
@@ -352,7 +360,47 @@
           loteResultado.classList.add("d-none");
         } finally {
           loteBtn.disabled = false;
-          loteBtn.textContent = "Procesar lote";
+          setLoteButtonsDisabled(false);
+        }
+      });
+
+      excelBtn.addEventListener("click", async () => {
+        const formData = buildLoteFormData();
+        if (!formData) {
+          setLoteAlert("Selecciona un archivo .txt o .csv con DNIs.", "warning");
+          loteResultado.classList.add("d-none");
+          return;
+        }
+
+        clearLoteAlert();
+        setLoteButtonsDisabled(true, "Generando Excel...");
+
+        try {
+          const response = await fetch("/consultar-lote-excel", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            setLoteAlert(data.error || "No fue posible generar el Excel.", "danger");
+            return;
+          }
+
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "consulta_onpe_lote.xlsx";
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          window.URL.revokeObjectURL(url);
+          setLoteAlert("Excel generado y descargado correctamente.", "success");
+        } catch (error) {
+          setLoteAlert("Error de red o del servidor al generar el Excel.", "danger");
+        } finally {
+          setLoteButtonsDisabled(false);
         }
       });
     </script>

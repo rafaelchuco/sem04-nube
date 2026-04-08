@@ -28,6 +28,8 @@ Abrir en navegador:
 
 - `GET /`: interfaz web
 - `POST /consultar`: consulta por DNI
+- `POST /consultar-lote`: consulta masiva y devuelve JSON
+- `POST /consultar-lote-excel`: consulta masiva y devuelve un archivo Excel
 
 Ejemplo de payload:
 
@@ -44,3 +46,4 @@ Ejemplo de payload:
 - Se usan selectores robustos por `name`, `role`, texto y atributos alternativos para tolerar cambios de UI.
 - El navegador se reutiliza entre solicitudes para mejor rendimiento.
 - Si ONPE presenta captcha o cambia su UI, el backend devuelve errores claros para el frontend.
+- En la carga masiva se puede descargar un Excel con DNI, estado, nombre y datos de ubicacion.

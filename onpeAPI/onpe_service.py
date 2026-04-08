@@ -178,35 +178,26 @@ class OnpePlaywrightClient:
 
                 response = {
                     "dni": dni,
+                    "nombre": parsed.nombre,
                     "es_miembro_mesa": parsed.es_miembro_mesa,
+                    "rol_mesa": parsed.rol_mesa,
                     "region_provincia_distrito": parsed.region_provincia_distrito,
                     "ubicacion_local": parsed.ubicacion_local,
                     "local_votacion": parsed.local_votacion,
+                    "direccion_local": parsed.direccion_local,
+                    "referencia_local": parsed.referencia_local,
+                    "numero_mesa": parsed.numero_mesa,
+                    "numero_orden": parsed.numero_orden,
+                    "pabellon": parsed.pabellon,
+                    "piso": parsed.piso,
+                    "aula": parsed.aula,
                     "onpe_response": {
                         "source": "dom",
                         "body_excerpt": body_text[:1200],
                     },
                 }
 
-                if parsed.es_miembro_mesa is True:
-                    response.update(
-                        {
-                            "nombre": parsed.nombre,
-                            "rol_mesa": parsed.rol_mesa,
-                            "direccion_local": parsed.direccion_local,
-                            "referencia_local": parsed.referencia_local,
-                            "numero_mesa": parsed.numero_mesa,
-                            "numero_orden": parsed.numero_orden,
-                            "pabellon": parsed.pabellon,
-                            "piso": parsed.piso,
-                            "aula": parsed.aula,
-                        }
-                    )
-
                 return response
-            except CaptchaRequiredError:
-                self._store_manual_session(context, page)
-                raise
             except PlaywrightTimeoutError as exc:
                 if self._captcha_visible(page):
                     self._store_manual_session(context, page)
@@ -360,37 +351,45 @@ class OnpePlaywrightClient:
         if not text:
             return None
 
-        nombre_match = re.search(r"Nombres y Apellidos\s+([^\n]+)", text, flags=re.IGNORECASE)
-        region_match = re.search(r"Regi[oó]n / Provincia / Distrito\s+([^\n]+)", text, flags=re.IGNORECASE)
+        nombre = self._extraer_texto_etiqueta(
+            text,
+            ["Nombres y Apellidos", "Nombre Completo", "Apellidos y Nombres", "Nombre"],
+        )
+        region = self._extraer_texto_etiqueta(
+            text,
+            ["Región / Provincia / Distrito", "Region / Provincia / Distrito"],
+        )
         local_match = re.search(
             r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+([^\n]+)",
             text,
             flags=re.IGNORECASE,
         )
-        direccion_match = re.search(
-            r"Tu local de votaci[oó]n\s+ver\s+Mapa\s+[^\n]+\s+([^\n]+)",
-            text,
-            flags=re.IGNORECASE,
-        )
-        referencia_match = re.search(r"Referencia:\s*([^\n]+)", text, flags=re.IGNORECASE)
-        mesa_match = re.search(r"N[°ºo] de Mesa:\s*([0-9]+)", text, flags=re.IGNORECASE)
-        orden_match = re.search(r"N[°ºo] de Orden:\s*([0-9]+)", text, flags=re.IGNORECASE)
-        pabellon_match = re.search(r"Pabell[oó]n\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
-        piso_match = re.search(r"Piso\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
-        aula_match = re.search(r"Aula\s+([0-9A-Z-]+)", text, flags=re.IGNORECASE)
-
-        nombre = nombre_match.group(1).strip() if nombre_match else None
-        region = region_match.group(1).strip() if region_match else None
         local = local_match.group(1).strip() if local_match else None
-        direccion = direccion_match.group(1).strip() if direccion_match else None
-        referencia_local = referencia_match.group(1).strip() if referencia_match else None
-        numero_mesa = mesa_match.group(1).strip() if mesa_match else None
-        numero_orden = orden_match.group(1).strip() if orden_match else None
-        pabellon = pabellon_match.group(1).strip() if pabellon_match else None
-        piso = piso_match.group(1).strip() if piso_match else None
-        aula = aula_match.group(1).strip() if aula_match else None
+        if not local:
+            local = self._extraer_texto_etiqueta(
+                text,
+                ["Local de votación", "Local de votacion", "Tu local de votación"],
+            )
+        direccion = self._extraer_texto_etiqueta(
+            text,
+            ["Dirección del local", "Direccion del local"],
+        )
+        referencia_local = self._extraer_texto_etiqueta(text, ["Referencia"])
+        numero_mesa = self._extraer_texto_etiqueta(
+            text,
+            ["N° de Mesa", "Nº de Mesa", "Nro de Mesa", "Número de Mesa", "Numero de Mesa", "Mesa"],
+        )
+        numero_orden = self._extraer_texto_etiqueta(
+            text,
+            ["N° de Orden", "Nº de Orden", "Nro de Orden", "Número de Orden", "Numero de Orden", "Orden"],
+        )
+        pabellon = self._extraer_texto_etiqueta(text, ["Pabellón", "Pabellon"])
+        piso = self._extraer_texto_etiqueta(text, ["Piso"])
+        aula = self._extraer_texto_etiqueta(text, ["Aula"])
 
         es_miembro_mesa, rol_mesa = self._extraer_rol_mesa_texto(text)
+        if es_miembro_mesa is False and not rol_mesa:
+            rol_mesa = "No es miembro de mesa"
 
         # Si solo hay etiquetas sin valores reales, no consideramos que el resultado este listo.
         valores_invalidos = {
@@ -400,15 +399,24 @@ class OnpePlaywrightClient:
             "region / provincia / distrito",
             "consultar",
             "oficina central",
+            "ver",
+            "ver mapa",
+            "mapa",
+            "no disponible",
+            "no aplica",
+            "sin informacion",
+            "sin información",
         }
-        if nombre and nombre.strip().casefold() in valores_invalidos:
-            nombre = None
-        if region and region.strip().casefold() in valores_invalidos:
-            region = None
-        if local and local.strip().casefold() in valores_invalidos:
-            local = None
-        if direccion and direccion.strip().casefold() in valores_invalidos:
-            direccion = None
+        nombre = self._normalizar_campo_resultado(nombre, valores_invalidos)
+        region = self._normalizar_campo_resultado(region, valores_invalidos)
+        local = self._normalizar_campo_resultado(local, valores_invalidos)
+        direccion = self._normalizar_campo_resultado(direccion, valores_invalidos)
+        referencia_local = self._normalizar_campo_resultado(referencia_local, valores_invalidos)
+        numero_mesa = self._normalizar_campo_resultado(numero_mesa, valores_invalidos)
+        numero_orden = self._normalizar_campo_resultado(numero_orden, valores_invalidos)
+        pabellon = self._normalizar_campo_resultado(pabellon, valores_invalidos)
+        piso = self._normalizar_campo_resultado(piso, valores_invalidos)
+        aula = self._normalizar_campo_resultado(aula, valores_invalidos)
 
         if not any(
             [
@@ -457,6 +465,52 @@ class OnpePlaywrightClient:
         return False
 
     @staticmethod
+    def _extraer_texto_etiqueta(texto: str, etiquetas: list[str]) -> str | None:
+        if not texto:
+            return None
+
+        for etiqueta in etiquetas:
+            patron_en_linea = re.compile(
+                rf"{re.escape(etiqueta)}\s*[:\-]?\s*([^\n]+)",
+                flags=re.IGNORECASE,
+            )
+            match = patron_en_linea.search(texto)
+            if match:
+                valor = match.group(1).strip()
+                if valor:
+                    return valor
+
+            patron_siguiente_linea = re.compile(
+                rf"{re.escape(etiqueta)}\s*[:\-]?\s*\n\s*([^\n]+)",
+                flags=re.IGNORECASE,
+            )
+            match = patron_siguiente_linea.search(texto)
+            if match:
+                valor = match.group(1).strip()
+                if valor:
+                    return valor
+
+        return None
+
+    @staticmethod
+    def _normalizar_campo_resultado(valor: str | None, invalidos: set[str]) -> str | None:
+        if not valor:
+            return None
+
+        limpio = re.sub(r"\s+", " ", valor).strip()
+        limpio = re.sub(r"\s*-\s*ver(?:\s+mapa)?\s*$", "", limpio, flags=re.IGNORECASE)
+        limpio = re.sub(r"\s+ver(?:\s+mapa)?\s*$", "", limpio, flags=re.IGNORECASE)
+        limpio = limpio.strip(" -")
+
+        if not limpio:
+            return None
+
+        if limpio.casefold() in invalidos:
+            return None
+
+        return limpio
+
+    @staticmethod
     def _extraer_valor_seguidor(lines: list[str], etiqueta: str) -> str | None:
         patron = re.compile(etiqueta, re.IGNORECASE)
         for index, line in enumerate(lines):
@@ -503,8 +557,8 @@ class OnpePlaywrightClient:
 
     @staticmethod
     def _extraer_rol_mesa_texto(text: str) -> tuple[bool | None, str | None]:
-        if re.search(r"^NO ERES MIEMBRO DE MESA$", text, flags=re.IGNORECASE | re.MULTILINE):
-            return False, None
+        if re.search(r"^NO\s+(?:ERES|ES)\s+MIEMBRO DE MESA$", text, flags=re.IGNORECASE | re.MULTILINE):
+            return False, "No es miembro de mesa"
 
         rol_match = re.search(r"^ERES\s+([^\n]+)$", text, flags=re.IGNORECASE | re.MULTILINE)
         if rol_match:
